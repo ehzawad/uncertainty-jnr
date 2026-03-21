@@ -1,0 +1,48 @@
+data:
+  root_dir: "data"
+  cache_dir: "cache"
+  target_size: [224, 224]
+  train_val_split: 0.8
+  batch_size: 48
+  val_batch_size: 48
+  num_workers: 4
+  pin_memory: true
+  dataset_type: "folder"
+  folder_dataset_dir: "final_dataset"
+  train_dataset_names: ["folder_train"]
+  val_dataset_names: ["val", "test"]
+
+model:
+  model_name: "timm/vit_small_patch16_224.augreg_in21k"
+  pretrained: true
+  gradient_clip_val: 1.0
+  finetune_from: null
+  classifier_type: "tied_digit_aware"
+  uncertainty_head: "dirichlet"
+  embedding_type: "multiplicative"
+  per_digit_bias: false
+
+loss:
+  loss_type: "dirichlet"
+  warmup_steps: 2500
+  reg_weight: 0.001
+  max_reg_weight: 0.05
+  label_smoothing: 0.01
+
+training:
+  seed: 42
+  max_epochs: 6
+  learning_rate: 1.0e-4
+  warmup_steps: 500
+  final_lr_scale: 4.0e-1
+  use_amp: true
+  compile_model: false
+  debug: false
+  debug_samples: 1000
+  logging_steps: 100
+  validation_steps: 1500
+
+logging:
+  base_dir: "runs"
+  experiment_name: "small16_final_dataset"
+  num_val_visualizations: 16
