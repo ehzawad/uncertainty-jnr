@@ -228,6 +228,7 @@ def main():
         per_digit_bias=config.model.per_digit_bias,
         uncertainty_head=config.model.uncertainty_head,
         use_decoder=config.model.use_decoder,
+        freeze_decoder=config.model.freeze_decoder,
     )
     load_checkpoint(model, checkpoint_path, device, strict=False)
     model = model.to(device)

@@ -61,6 +61,7 @@ class ModelConfig(BaseModel):
     # Spatial decoder (PARseq-style cross-attention on patches)
     use_decoder: bool = False
     parseq_weights_path: Optional[Path] = None
+    freeze_decoder: bool = False  # Freeze PARseq weights to preserve text-reading ability
 
 
 class LossConfig(BaseModel):
@@ -112,6 +113,8 @@ class TrainingConfig(BaseModel):
     early_stopping_min_delta: float = 0.1
     # Resume training from checkpoint (restores optimizer, scheduler, step)
     resume_from: Optional[Path] = None
+    # Backbone LR multiplier (< 1.0 preserves pretrained features for cross-domain)
+    backbone_lr_scale: float = 1.0
 
 
 class LoggingConfig(BaseModel):

@@ -28,6 +28,7 @@ model:
   # Spatial decoder
   use_decoder: true
   parseq_weights_path: "../object-detection-test/parseq/pretrained/parseq_small.pt"
+  freeze_decoder: true  # Keep PARseq as frozen text reader for cross-domain
 
 loss:
   loss_type: "dirichlet"
@@ -52,6 +53,8 @@ training:
   # Early stopping
   early_stopping_patience: 5
   early_stopping_min_delta: 0.1
+  # Backbone gets 10% of head LR to preserve pretrained features
+  backbone_lr_scale: 0.1
 
 logging:
   base_dir: "runs"

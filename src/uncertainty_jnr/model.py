@@ -227,6 +227,34 @@ class DecoderLayer(nn.Module):
         return query, content, ca_weights
 
 
+class TextRegionHead(nn.Module):
+    """Lightweight patch-level text detector.
+
+    Predicts per-patch probability of containing text/digits.
+    Used to modulate patch tokens before the decoder's cross-attention,
+    separating WHERE (this head) from WHAT (frozen decoder).
+    """
+
+    def __init__(self, embed_dim: int = 384, hidden_dim: int = 64):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, patch_tokens: torch.Tensor):
+        """
+        Args:
+            patch_tokens: (B, num_patches, embed_dim)
+        Returns:
+            masked_tokens: (B, num_patches, embed_dim) — text-weighted patches
+            scores: (B, num_patches, 1) — per-patch text probability
+        """
+        scores = torch.sigmoid(self.mlp(patch_tokens))  # (B, 196, 1)
+        return patch_tokens * scores, scores
+
+
 class DigitDecoder(nn.Module):
     """PARseq-style spatial decoder for jersey digit reading.
 
@@ -379,6 +407,7 @@ class TimmOCRModel(torch.nn.Module):
         size_embedding: bool = False,
         use_decoder: bool = False,
         parseq_weights_path: Optional[Path] = None,
+        freeze_decoder: bool = False,
         **kwargs: Dict[str, Any],
     ):
         """Initialize the OCR model.
@@ -452,6 +481,8 @@ class TimmOCRModel(torch.nn.Module):
         self.use_decoder = use_decoder
         if use_decoder:
             self.decoder = DigitDecoder(embed_dim)
+            # Text region head: learns WHERE digits are on patches
+            self.text_region_head = TextRegionHead(embed_dim)
             # Gate parameter: sigmoid(0) = 0.5 initial weight
             self.gate_param = nn.Parameter(torch.tensor(0.0))
             # Attention pooling for temporal (5D) input
@@ -459,6 +490,14 @@ class TimmOCRModel(torch.nn.Module):
             # Load PARseq pretrained weights
             if parseq_weights_path is not None:
                 load_parseq_weights(self.decoder, Path(parseq_weights_path))
+            # Freeze decoder to preserve text-reading ability (only train pos_queries + gate)
+            if freeze_decoder:
+                for name, param in self.decoder.named_parameters():
+                    if "pos_queries" not in name:
+                        param.requires_grad = False
+                n_frozen = sum(1 for n, p in self.decoder.named_parameters() if not p.requires_grad)
+                n_total = sum(1 for _ in self.decoder.parameters())
+                logger.info(f"Frozen {n_frozen}/{n_total} decoder params (keeping pos_queries trainable)")
 
     def forward(
         self,
@@ -504,17 +543,25 @@ class TimmOCRModel(torch.nn.Module):
             cls_features = all_tokens[:, 0]  # (B, D)
             patch_tokens = all_tokens[:, 1:] if self.use_decoder else None
 
-        # Path 1: Classifier (UNCHANGED paper architecture)
-        classifier_logits = self.classifier(cls_features)  # (B, 101)
-
-        # Path 2: Decoder (spatial attention on patches)
+        # Text region masking: both paths see ONLY text-focused features
         decoder_pos_logits = None
         if self.use_decoder and patch_tokens is not None:
-            decoder_logits, decoder_pos_logits = self.decoder(patch_tokens)
+            masked_patches, _text_scores = self.text_region_head(patch_tokens)
+
+            # Path 1: Classifier on text-focused features (not sport-specific CLS)
+            # Attention-pool the text-masked patches into a single vector
+            text_features = masked_patches.mean(dim=1)  # (B, D) — avg pool text patches
+            classifier_logits = self.classifier(text_features)
+
+            # Path 2: Frozen decoder reads digits from text-masked patches
+            decoder_logits, decoder_pos_logits = self.decoder(masked_patches)
+
             # Geometric mixture: final = (1-g)*cls + g*dec
             gate = torch.sigmoid(self.gate_param)
             all_logits = (1 - gate) * classifier_logits + gate * decoder_logits
         else:
+            # Fallback: no decoder, use CLS token
+            classifier_logits = self.classifier(cls_features)
             all_logits = classifier_logits
 
         # Extract number logits (excluding absent class)

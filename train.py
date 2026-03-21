@@ -746,6 +746,7 @@ def train_worker(
         size_embedding=config.model.size_embedding,
         use_decoder=config.model.use_decoder,
         parseq_weights_path=config.model.parseq_weights_path,
+        freeze_decoder=config.model.freeze_decoder,
     )
 
     # Load checkpoint if provided
@@ -767,20 +768,38 @@ def train_worker(
             model, mode="default" if world_size == 1 else "reduce-overhead"
         )
 
-    # Setup optimizer and scheduler
-    optimizer = AdamW(
-        model.parameters(),
-        lr=config.training.learning_rate,
-        fused=True,
-        weight_decay=1e-3,
-    )
+    # Setup optimizer with differential learning rate
+    # Lower LR for backbone preserves pretrained features for cross-domain generalization
+    backbone_lr_scale = getattr(config.training, "backbone_lr_scale", 1.0)
+    base_lr = config.training.learning_rate
+    base_model = get_base_model(model)
+
+    if backbone_lr_scale < 1.0 and hasattr(base_model, "backbone"):
+        backbone_params = list(base_model.backbone.parameters())
+        backbone_ids = {id(p) for p in backbone_params}
+        head_params = [p for p in model.parameters() if id(p) not in backbone_ids]
+        param_groups = [
+            {"params": backbone_params, "lr": base_lr * backbone_lr_scale},
+            {"params": head_params, "lr": base_lr},
+        ]
+        if rank == 0 and logger:
+            logger.info(f"Differential LR: backbone={base_lr * backbone_lr_scale:.6f}, heads={base_lr:.6f}")
+        optimizer = AdamW(param_groups, lr=base_lr, fused=True, weight_decay=1e-3)
+    else:
+        optimizer = AdamW(model.parameters(), lr=base_lr, fused=True, weight_decay=1e-3)
 
     total_steps = len(train_loader) * config.training.max_epochs
     warmup_pct = min(config.training.warmup_steps / total_steps, 0.5)
 
+    # OneCycleLR needs per-group max_lr when using param groups
+    if len(optimizer.param_groups) > 1:
+        max_lrs = [pg["lr"] for pg in optimizer.param_groups]
+    else:
+        max_lrs = base_lr
+
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=config.training.learning_rate,
+        max_lr=max_lrs,
         total_steps=total_steps,
         pct_start=warmup_pct,
         div_factor=25,
