@@ -62,6 +62,7 @@ class ModelConfig(BaseModel):
     use_decoder: bool = False
     parseq_weights_path: Optional[Path] = None
     freeze_decoder: bool = False  # Freeze PARseq weights to preserve text-reading ability
+    use_stn: bool = False  # Use STN + frozen PARseq architecture
 
 
 class LossConfig(BaseModel):

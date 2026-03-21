@@ -19,6 +19,7 @@ from torch.utils.data.distributed import DistributedSampler
 import typing
 
 from uncertainty_jnr.model import TimmOCRModel, ModelOutput
+from uncertainty_jnr.stn_model import STNJerseyModel
 from uncertainty_jnr.loss import Type2DirichletLoss, SoftmaxWithUncertaintyLoss
 from uncertainty_jnr.datasets import create_datasets
 from uncertainty_jnr.data import DynamicBatchSampler, tracklet_collate_fn
@@ -736,18 +737,26 @@ def train_worker(
         )
 
     # Create model
-    model = TimmOCRModel(
-        model_name=config.model.model_name,
-        pretrained=config.model.pretrained,
-        classifier_type=config.model.classifier_type,
-        embedding_type=config.model.embedding_type,
-        per_digit_bias=config.model.per_digit_bias,
-        uncertainty_head=config.model.uncertainty_head,
-        size_embedding=config.model.size_embedding,
-        use_decoder=config.model.use_decoder,
-        parseq_weights_path=config.model.parseq_weights_path,
-        freeze_decoder=config.model.freeze_decoder,
-    )
+    use_stn = getattr(config.model, "use_stn", False)
+    if use_stn:
+        model = STNJerseyModel(vit_model_name=config.model.model_name)
+        if rank == 0 and logger:
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in model.parameters())
+            logger.info(f"STN model: {trainable:,} trainable / {total:,} total params")
+    else:
+        model = TimmOCRModel(
+            model_name=config.model.model_name,
+            pretrained=config.model.pretrained,
+            classifier_type=config.model.classifier_type,
+            embedding_type=config.model.embedding_type,
+            per_digit_bias=config.model.per_digit_bias,
+            uncertainty_head=config.model.uncertainty_head,
+            size_embedding=config.model.size_embedding,
+            use_decoder=config.model.use_decoder,
+            parseq_weights_path=config.model.parseq_weights_path,
+            freeze_decoder=config.model.freeze_decoder,
+        )
 
     # Load checkpoint if provided
     if config.model.finetune_from is not None:

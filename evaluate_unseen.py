@@ -17,6 +17,7 @@ import cv2
 from collections import defaultdict
 
 from uncertainty_jnr.model import TimmOCRModel
+from uncertainty_jnr.stn_model import STNJerseyModel
 from uncertainty_jnr.augmentation import get_val_transforms
 from uncertainty_jnr.utils import load_checkpoint, setup_logging
 from config import Config
@@ -220,17 +221,22 @@ def main():
     logging.info(f"Device: {device}")
 
     # Load model
-    model = TimmOCRModel(
-        model_name=config.model.model_name,
-        pretrained=False,
-        classifier_type=config.model.classifier_type,
-        embedding_type=config.model.embedding_type,
-        per_digit_bias=config.model.per_digit_bias,
-        uncertainty_head=config.model.uncertainty_head,
-        use_decoder=config.model.use_decoder,
-        freeze_decoder=config.model.freeze_decoder,
-    )
-    load_checkpoint(model, checkpoint_path, device, strict=False)
+    use_stn = getattr(config.model, "use_stn", False)
+    if use_stn:
+        model = STNJerseyModel(vit_model_name=config.model.model_name)
+        load_checkpoint(model, checkpoint_path, device, strict=False)
+    else:
+        model = TimmOCRModel(
+            model_name=config.model.model_name,
+            pretrained=False,
+            classifier_type=config.model.classifier_type,
+            embedding_type=config.model.embedding_type,
+            per_digit_bias=config.model.per_digit_bias,
+            uncertainty_head=config.model.uncertainty_head,
+            use_decoder=config.model.use_decoder,
+            freeze_decoder=config.model.freeze_decoder,
+        )
+        load_checkpoint(model, checkpoint_path, device, strict=False)
     model = model.to(device)
     model.eval()
     logging.info("Model loaded")
