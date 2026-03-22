@@ -1,14 +1,11 @@
 """Spatial Transformer + Frozen PARseq for cross-domain jersey number recognition.
 
-Architecture:
+Architecture (v2 — fixes absent detection, single-digit bias, static crop):
     Image (224x224) → Frozen ViT → patch features
-                    → Localization MLP → crop box (cy, cx, h, w)
+                    → Spatial soft-argmax localization → crop box
                     → Differentiable crop (grid_sample) → tight number region (32x128)
-                    → Frozen PARseq → digit string
-                    → Number composition + Dirichlet uncertainty
-
-Only the localization MLP and composition head train.
-Everything else is frozen pretrained weights.
+                    → Frozen PARseq → digit string (log-space composition)
+                    → Absent classifier (from patches) + Number logits → Dirichlet uncertainty
 """
 
 import torch
@@ -16,7 +13,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import timm
 import logging
-from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass
 
@@ -31,118 +27,152 @@ class STNModelOutput:
     probs: torch.Tensor           # (B, 101)
     uncertainty: torch.Tensor     # (B,)
     predicted_number: torch.Tensor  # (B,)
-    crop_params: torch.Tensor     # (B, 4) — cy, cx, h, w for visualization
-    decoder_pos_logits: Optional[torch.Tensor] = None  # for aux loss compatibility
+    crop_params: torch.Tensor     # (B, 4) — cy, cx, h, w
+    decoder_pos_logits: Optional[torch.Tensor] = None
 
 
 class LocalizationHead(nn.Module):
-    """Predicts crop box from ViT patch features.
+    """Predicts crop box via spatial soft-argmax on ViT patches.
 
-    Takes 196 patch tokens (384-dim each) and predicts where the
-    jersey number is: (center_y, center_x, height, width) in [0, 1].
-
-    Uses attention pooling to weight patches by importance before predicting.
+    Uses attention scores over the 14x14 patch grid to compute a
+    differentiable center (cy, cx) via soft-argmax. Size (h, w) is
+    predicted from the attended feature. This ensures the crop location
+    is spatially meaningful and input-dependent.
     """
 
     def __init__(self, embed_dim: int = 384, hidden_dim: int = 128):
         super().__init__()
-        # Attention pooling: learn which patches are informative for localization
+        # Attention scoring: which patches are text-like?
         self.attn = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, 1),
         )
-        # Predict crop params from pooled features
-        self.head = nn.Sequential(
+        # Learnable temperature for attention sharpness
+        self.temperature = nn.Parameter(torch.tensor(1.0))
+
+        # Size prediction from attended feature
+        self.size_head = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 4),  # cy, cx, h, w
+            nn.Linear(hidden_dim, 2),  # h, w only
         )
-        # Initialize to center crop (bias toward middle of image, moderate size)
-        nn.init.zeros_(self.head[-1].weight)
-        self.head[-1].bias.data = torch.tensor([0.0, 0.0, 0.0, 1.0])
+        # Initialize to moderate crop size
+        nn.init.zeros_(self.size_head[-1].weight)
+        self.size_head[-1].bias.data = torch.tensor([0.0, 1.0])
+
+        # Spatial coordinates for 14x14 patch grid
+        ys = torch.linspace(0, 1, 14).unsqueeze(1).expand(14, 14).reshape(-1)
+        xs = torch.linspace(0, 1, 14).unsqueeze(0).expand(14, 14).reshape(-1)
+        self.register_buffer("patch_ys", ys)
+        self.register_buffer("patch_xs", xs)
 
     def forward(self, patch_tokens: torch.Tensor) -> torch.Tensor:
         """
         Args:
             patch_tokens: (B, 196, 384)
         Returns:
-            crop_params: (B, 4) — sigmoid-activated (cy, cx, h, w) in [0, 1]
+            crop_params: (B, 4) — (cy, cx, h, w) where cy/cx from soft-argmax [0,1],
+                         h/w from sigmoid [0,1]
         """
-        # Attention-weighted pooling
-        attn_weights = self.attn(patch_tokens)  # (B, 196, 1)
-        attn_weights = F.softmax(attn_weights, dim=1)  # normalize over patches
-        pooled = (patch_tokens * attn_weights).sum(dim=1)  # (B, 384)
+        # Attention scores
+        attn_logits = self.attn(patch_tokens).squeeze(-1)  # (B, 196)
+        temp = self.temperature.clamp(min=0.1)
+        attn_weights = F.softmax(attn_logits / temp, dim=1)  # (B, 196)
 
-        # Predict crop params
-        raw = self.head(pooled)  # (B, 4)
-        params = torch.sigmoid(raw)  # all in [0, 1]
-        return params
+        # Spatial soft-argmax for center
+        cy = (attn_weights * self.patch_ys.unsqueeze(0)).sum(dim=1)  # (B,)
+        cx = (attn_weights * self.patch_xs.unsqueeze(0)).sum(dim=1)  # (B,)
+
+        # Attended feature for size prediction
+        pooled = (patch_tokens * attn_weights.unsqueeze(-1)).sum(dim=1)  # (B, 384)
+        size_raw = self.size_head(pooled)  # (B, 2)
+        h = torch.sigmoid(size_raw[:, 0])
+        w = torch.sigmoid(size_raw[:, 1])
+
+        return torch.stack([cy, cx, h, w], dim=1)  # (B, 4)
+
+
+class AbsentClassifierHead(nn.Module):
+    """Binary classifier for absent/visible jersey number.
+
+    Operates directly on ViT patch features. PARseq can't detect absent
+    (it always tries to read something). This head learns from the
+    has_prediction labels in training data.
+    """
+
+    def __init__(self, embed_dim: int = 384, hidden_dim: int = 128):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        # Bias toward "number present" (majority class)
+        nn.init.zeros_(self.head[-1].weight)
+        self.head[-1].bias.data = torch.tensor([-2.0])
+
+    def forward(self, patch_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            patch_tokens: (B, 196, 384)
+        Returns:
+            absent_logit: (B, 1)
+        """
+        # Simple mean pool — all patches contribute equally
+        pooled = patch_tokens.mean(dim=1)  # (B, 384)
+        return self.head(pooled)  # (B, 1)
 
 
 class NumberCompositionHead(nn.Module):
-    """Converts PARseq character logits to 101-class jersey number logits.
+    """Converts PARseq character logits to 100-class jersey number logits.
 
-    PARseq outputs (B, max_len, charset_size) character logits.
-    We take the first 2 decoded positions, extract digit probabilities (0-9),
-    and compose into 101-class number logits (0-99 + absent).
+    Works in LOG-SPACE to avoid single-digit bias from probability multiplication.
+    Absent detection is handled by a separate AbsentClassifierHead.
     """
 
-    def __init__(self, charset_size: int = 95, max_positions: int = 2):
+    def __init__(self):
         super().__init__()
-        self.charset_size = charset_size
-        self.max_positions = max_positions
-        # Digit indices in PARseq charset: '0'-'9' are indices 0-9 after BOS/EOS/PAD
-        # Standard PARseq charset: 0123456789abcdefg... digits are first 10 chars
-        # But charset includes [BOS], [EOS], [PAD] tokens managed by the tokenizer
+        # Learnable length bias: corrects for systematic single-vs-double digit bias
+        self.length_bias = nn.Parameter(torch.tensor(0.0))
 
-    def forward(self, parseq_logits: torch.Tensor, eos_idx: int = 0) -> torch.Tensor:
+    def forward(self, parseq_logits: torch.Tensor) -> torch.Tensor:
         """
         Args:
             parseq_logits: (B, max_label_len, charset_size) raw logits from PARseq
-            eos_idx: index of EOS token in charset
         Returns:
-            number_logits: (B, 101) composed jersey number logits
+            number_logits: (B, 100) composed jersey number logits (no absent)
         """
-        B = parseq_logits.size(0)
         device = parseq_logits.device
 
-        # Get probabilities for each position
-        probs = parseq_logits.softmax(dim=-1)  # (B, max_len, charset)
+        # Log-space to avoid probability multiplication bias
+        log_probs = F.log_softmax(parseq_logits, dim=-1)  # (B, max_len, charset)
 
-        # Digit probs: indices 1-10 in PARseq charset (after EOS at 0)
-        # PARseq charset: [EOS] + charset_train, so '0' is index 1, '9' is index 10
-        digit_probs_pos1 = probs[:, 0, 1:11]  # (B, 10) — first char position
-        digit_probs_pos2 = probs[:, 1, 1:11]  # (B, 10) — second char position
+        # Log digit probs: charset indices 1-10 = digits '0'-'9'
+        log_digit_pos1 = log_probs[:, 0, 1:11]  # (B, 10)
+        log_digit_pos2 = log_probs[:, 1, 1:11]  # (B, 10)
 
-        # EOS probability at each position (indicates sequence ended)
-        eos_prob_pos1 = probs[:, 0, 0:1]  # (B, 1) — EOS at first position = absent
-        eos_prob_pos2 = probs[:, 1, 0:1]  # (B, 1) — EOS at second = single digit
+        # Log EOS prob at position 2 (sequence length = 1 → single digit)
+        log_eos_pos2 = log_probs[:, 1, 0:1]  # (B, 1)
 
-        # Compose 101-class logits
-        # Single digit (0-9): pos1 is the digit AND pos2 is EOS
-        single_digit = digit_probs_pos1 * eos_prob_pos2  # (B, 10)
+        # Single digit (0-9): log P(digit@pos1) + log P(EOS@pos2)
+        single_digit_logits = log_digit_pos1 + log_eos_pos2  # (B, 10)
 
-        # Two digit (10-99): pos1 is tens, pos2 is ones
+        # Two digit (10-99): log P(tens@pos1) + log P(ones@pos2) + length_bias
         tens_idx = torch.div(torch.arange(10, 100, device=device), 10, rounding_mode="floor")
         ones_idx = torch.remainder(torch.arange(10, 100, device=device), 10)
-        two_digit = digit_probs_pos1[:, tens_idx] * digit_probs_pos2[:, ones_idx]  # (B, 90)
+        two_digit_logits = log_digit_pos1[:, tens_idx] + log_digit_pos2[:, ones_idx] + self.length_bias
 
-        # Absent: EOS at first position
-        absent = eos_prob_pos1  # (B, 1)
-
-        # Stack: [single_digit(10), two_digit(90), absent(1)] = 101
-        number_probs = torch.cat([single_digit, two_digit, absent], dim=1)  # (B, 101)
-
-        # Convert back to logits (log-space) for Dirichlet head
-        number_logits = torch.log(number_probs + 1e-8)
+        # Stack: [single(10), two_digit(90)] = 100
+        number_logits = torch.cat([single_digit_logits, two_digit_logits], dim=1)  # (B, 100)
         return number_logits
 
 
 class STNJerseyModel(nn.Module):
     """Spatial Transformer + Frozen PARseq for jersey number recognition.
 
-    Only the localization head trains. ViT backbone and PARseq are frozen.
+    Trainable: LocalizationHead, AbsentClassifierHead, NumberCompositionHead.length_bias,
+               log_temperature. Everything else frozen.
     """
 
     def __init__(
@@ -159,10 +189,11 @@ class STNJerseyModel(nn.Module):
         embed_dim = self.backbone.embed_dim
         logger.info(f"Frozen ViT backbone: {vit_model_name} (embed_dim={embed_dim})")
 
-        # Trainable localization head
+        # Trainable heads
         self.loc_head = LocalizationHead(embed_dim)
+        self.absent_head = AbsentClassifierHead(embed_dim)
 
-        # Frozen PARseq (full encoder + decoder, pretrained on scene text)
+        # Frozen PARseq
         self.parseq = torch.hub.load(
             "baudm/parseq", "parseq", pretrained=True, trust_repo=True
         )
@@ -172,7 +203,7 @@ class STNJerseyModel(nn.Module):
         self.parseq_input_size = parseq_input_size
         logger.info("Frozen PARseq loaded (pretrained scene text reader)")
 
-        # Number composition: PARseq chars → 101-class logits
+        # Number composition (log-space, no absent)
         self.composition = NumberCompositionHead()
 
         # Learnable temperature for Dirichlet sharpness
@@ -182,52 +213,30 @@ class STNJerseyModel(nn.Module):
         """Extract patch tokens from frozen ViT (no CLS)."""
         with torch.no_grad():
             features = self.backbone.forward_features(x)
-        # features: (B, 197, D) — CLS + 196 patches
         return features[:, 1:]  # (B, 196, D)
 
-    def _crop_region(
-        self, images: torch.Tensor, crop_params: torch.Tensor
-    ) -> torch.Tensor:
-        """Differentiable crop using grid_sample.
-
-        Args:
-            images: (B, 3, H, W) original images
-            crop_params: (B, 4) — (cy, cx, h, w) in [0, 1]
-
-        Returns:
-            cropped: (B, 3, 32, 128) — PARseq-sized crops
-        """
+    def _crop_region(self, images: torch.Tensor, crop_params: torch.Tensor) -> torch.Tensor:
+        """Differentiable crop using grid_sample."""
         B = images.size(0)
         cy, cx, h, w = crop_params[:, 0], crop_params[:, 1], crop_params[:, 2], crop_params[:, 3]
 
-        # Scale h and w: min 0.15, max 0.8 of image
-        h = 0.15 + h * 0.65  # [0.15, 0.8]
-        w = 0.2 + w * 0.6   # [0.2, 0.8]
+        # Scale h and w: min 0.15, max 0.8
+        h = 0.15 + h * 0.65
+        w = 0.2 + w * 0.6
 
         # Convert to grid_sample coordinates [-1, 1]
-        # cy, cx are center in [0, 1], convert to [-1, 1]
         cy_grid = cy * 2 - 1
         cx_grid = cx * 2 - 1
 
-        # Build affine grid for each sample
         out_h, out_w = self.parseq_input_size
         theta = torch.zeros(B, 2, 3, device=images.device)
-        theta[:, 0, 0] = w      # x scale
-        theta[:, 1, 1] = h      # y scale
-        theta[:, 0, 2] = cx_grid  # x translation
-        theta[:, 1, 2] = cy_grid  # y translation
+        theta[:, 0, 0] = w
+        theta[:, 1, 1] = h
+        theta[:, 0, 2] = cx_grid
+        theta[:, 1, 2] = cy_grid
 
         grid = F.affine_grid(theta, (B, 3, out_h, out_w), align_corners=False)
-        cropped = F.grid_sample(images, grid, align_corners=False, mode="bilinear", padding_mode="border")
-
-        return cropped
-
-    def _parseq_normalize(self, images: torch.Tensor) -> torch.Tensor:
-        """Normalize cropped images for PARseq (expects [0,1] → [-1,1])."""
-        # Our images are in [-1, 1] (uncertainty_jnr normalization)
-        # PARseq expects: (img / 255 - 0.5) / 0.5 = img / 127.5 - 1 = same as ours
-        # So no extra normalization needed if input is already [-1, 1]
-        return images
+        return F.grid_sample(images, grid, align_corners=False, mode="bilinear", padding_mode="border")
 
     def forward(
         self,
@@ -235,40 +244,31 @@ class STNJerseyModel(nn.Module):
         t: Optional[torch.Tensor] = None,
         size: Optional[torch.Tensor] = None,
     ) -> STNModelOutput:
-        """
-        Args:
-            x: (B, 3, 224, 224) or (B, T, 3, 224, 224) images
-        """
-        # Handle tracklet input: use middle frame
+        # Handle tracklet: use middle frame
         if x.ndim == 5:
-            B, T = x.shape[:2]
-            mid = T // 2
-            x = x[:, mid]  # (B, 3, H, W) — pick middle frame
+            x = x[:, x.shape[1] // 2]
 
-        # Step 1: Extract patch features from frozen ViT
+        # Step 1: Frozen ViT patch features
         patch_tokens = self._extract_patches(x)  # (B, 196, 384)
 
-        # Step 2: Predict crop location
+        # Step 2: Predict crop location (spatial soft-argmax)
         crop_params = self.loc_head(patch_tokens)  # (B, 4)
 
         # Step 3: Differentiable crop
         cropped = self._crop_region(x, crop_params)  # (B, 3, 32, 128)
-        cropped_normalized = self._parseq_normalize(cropped)
 
-        # Step 4: Frozen PARseq reads the cropped region
-        with torch.no_grad():
-            parseq_logits = self.parseq(cropped_normalized)  # (B, max_len, charset)
+        # Step 4: Frozen PARseq reads the crop (gradients flow through grid_sample)
+        parseq_logits = self.parseq(cropped)  # (B, max_len, charset)
 
-        # But we need gradients to flow to loc_head through the crop!
-        # Re-run with gradient through the crop (PARseq weights frozen but graph connected)
-        parseq_logits = self.parseq(cropped_normalized)  # (B, max_len, charset)
+        # Step 5: Log-space number composition (100 classes, no absent)
+        number_logits_raw = self.composition(parseq_logits)  # (B, 100)
 
-        # Step 5: Compose into 101-class number logits
-        number_logits_raw = self.composition(parseq_logits)  # (B, 101)
+        # Step 6: Absent classifier from patch features
+        absent_logit = self.absent_head(patch_tokens)  # (B, 1)
 
-        # Apply learnable temperature
+        # Combine: [100 number logits, 1 absent logit]
         temp = self.log_temperature.exp()
-        all_logits = number_logits_raw * temp
+        all_logits = torch.cat([number_logits_raw * temp, absent_logit], dim=1)  # (B, 101)
 
         # Dirichlet uncertainty
         number_logits = all_logits[:, :100]
@@ -278,7 +278,6 @@ class STNJerseyModel(nn.Module):
         uncertainty = (100.0 / S).squeeze(1)
         predicted_number = probs.argmax(dim=1)
 
-        # Full probs including absent
         all_alpha = torch.exp(all_logits) + 1.0
         all_S = all_alpha.sum(dim=1, keepdim=True)
         all_probs = all_alpha / all_S

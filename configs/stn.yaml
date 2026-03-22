@@ -36,9 +36,9 @@ loss:
 
 training:
   seed: 42
-  max_epochs: 20
-  learning_rate: 1.0e-3
-  warmup_steps: 200
+  max_epochs: 30
+  learning_rate: 5.0e-4
+  warmup_steps: 500
   final_lr_scale: 2.0e-1
   use_amp: true
   compile_model: false
