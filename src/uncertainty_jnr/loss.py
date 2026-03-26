@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 from typing import Optional, Tuple, Union
-from uncertainty_jnr.model import ModelOutput
+from uncertainty_jnr.model import STNModelOutput as ModelOutput
 
 
 class LossWrapper(torch.nn.Module):
@@ -45,6 +45,7 @@ class Type2DirichletLoss(torch.nn.Module):
         warmup_steps: int = 500,
         max_reg_weight: float = 0.1,
         decoder_aux_weight: float = 0.0,
+        absent_bce_weight: float = 0.0,
     ):
         """Initialize the loss function.
 
@@ -61,6 +62,7 @@ class Type2DirichletLoss(torch.nn.Module):
         self.warmup_steps = warmup_steps
         self.max_reg_weight = max_reg_weight
         self.decoder_aux_weight = decoder_aux_weight
+        self.absent_bce_weight = absent_bce_weight
         self.uniform_alpha = torch.ones(num_classes)
 
     def forward(
@@ -140,7 +142,17 @@ class Type2DirichletLoss(torch.nn.Module):
         else:
             aux_loss = torch.tensor(0.0, device=logits.device)
 
-        return total_loss, mean_ml_loss, mean_kl_div
+        # BCE loss on absent classifier (direct supervision)
+        absent_bce = torch.tensor(0.0, device=logits.device)
+        if self.absent_bce_weight > 0 and model_output.all_logits.size(1) > 100:
+            absent_logit = model_output.all_logits[:, 100]  # (B,)
+            absent_target = (1.0 - has_prediction).float()  # 1 = absent, 0 = visible
+            absent_bce = F.binary_cross_entropy_with_logits(
+                absent_logit, absent_target, reduction="mean"
+            )
+            total_loss = total_loss + self.absent_bce_weight * absent_bce
+
+        return total_loss, mean_ml_loss, mean_kl_div, absent_bce
 
     def _decoder_aux_loss(
         self,
@@ -166,15 +178,15 @@ class Type2DirichletLoss(torch.nn.Module):
         targets_masked = targets[mask]  # (N,)
 
         # Decompose target into digit positions
-        # Single-digit (0-9): pos1 = target, pos2 = target (self-consistent)
+        # Single-digit (0-9): pos1 = target, pos2 = absent (10) — no second digit
         # Two-digit (10-99): pos1 = tens digit, pos2 = ones digit
         tens_digits = torch.div(targets_masked, 10, rounding_mode="floor")  # (N,)
         ones_digits = targets_masked % 10  # (N,)
 
-        # For single-digit numbers, pos1 target is the number itself
         is_single = targets_masked < 10
+        absent_marker = torch.tensor(10, device=pos_logits.device)
         pos1_targets = torch.where(is_single, targets_masked, tens_digits)
-        pos2_targets = torch.where(is_single, targets_masked, ones_digits)
+        pos2_targets = torch.where(is_single, absent_marker, ones_digits)
 
         # CE loss on each position
         loss_pos1 = F.cross_entropy(pos_logits[:, 0], pos1_targets)

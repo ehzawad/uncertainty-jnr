@@ -193,8 +193,8 @@ def get_train_transforms(
             RandomScaling(p=p_scale, interpolation_method=interpolation_method)
         )
 
-    # Capture size after potential scaling (Original Position)
-    transforms.append(SizeCapture(always_apply=True))
+    # NOTE: SizeCapture removed — albumentations params dict mutations are no-ops.
+    # Size is captured directly in dataset __getitem__ before transforms.
 
     # Add jersey crop if requested (Original Position)
     if center_crop:
@@ -260,7 +260,7 @@ def get_val_transforms(
     transforms = []
     interpolation = INTERPOLATION_MAP[interpolation_method]
 
-    transforms.append(SizeCapture(always_apply=True))
+    # NOTE: SizeCapture removed — albumentations params dict mutations are no-ops.
 
     # Add jersey crop if requested
     if center_crop:

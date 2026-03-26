@@ -11,6 +11,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 import hashlib
 import pickle
+from uncertainty_jnr.preprocessing import letterbox_resize
 
 
 @dataclass

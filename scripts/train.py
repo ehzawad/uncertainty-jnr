@@ -1,3 +1,4 @@
+import sys; sys.path.insert(0, ".")
 import torch
 from torch.utils.data import DataLoader
 from torch.optim.adamw import AdamW
@@ -18,7 +19,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 import typing
 
-from uncertainty_jnr.model import TimmOCRModel, ModelOutput
+from uncertainty_jnr.model import STNJerseyModel, STNModelOutput
 from uncertainty_jnr.loss import Type2DirichletLoss, SoftmaxWithUncertaintyLoss
 from uncertainty_jnr.datasets import create_datasets
 from uncertainty_jnr.data import DynamicBatchSampler, tracklet_collate_fn
@@ -71,7 +72,7 @@ class RankLogger(logging.LoggerAdapter):
 
 
 def compute_accuracy(
-    model_output: ModelOutput,
+    model_output: STNModelOutput,
     targets: torch.Tensor,
     number_mask: Optional[torch.Tensor] = None,
     topk: tuple[int, ...] = (1, 3),
@@ -145,11 +146,13 @@ def train_and_evaluate(
         loss_reg_weight = config.loss.reg_weight if config.loss else 0.001
         loss_max_reg_weight = config.loss.max_reg_weight if config.loss else 0.05
         decoder_aux_weight = config.loss.decoder_aux_weight if config.loss else 0.0
+        absent_bce_weight = getattr(config.loss, "absent_bce_weight", 0.0) if config.loss else 0.0
         criterion = Type2DirichletLoss(
             warmup_steps=loss_warmup_steps,
             reg_weight=loss_reg_weight,
             max_reg_weight=loss_max_reg_weight,
             decoder_aux_weight=decoder_aux_weight,
+            absent_bce_weight=absent_bce_weight,
         )
     # Check config.loss is not None before accessing attributes for softmax
     elif config.loss is not None and config.loss.loss_type == "softmax":
@@ -271,7 +274,7 @@ def train_and_evaluate(
             if scaler is not None:
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
                     model_output = model(images, t=t, size=size)
-                    loss, ml_loss, kl_loss = criterion(
+                    loss, ml_loss, kl_loss, *_extra = criterion(
                         model_output, targets, has_prediction, step=global_step
                     )
 
@@ -283,7 +286,7 @@ def train_and_evaluate(
                 scaler.update()
             else:
                 model_output = model(images, t=t, size=size)
-                loss, ml_loss, kl_loss = criterion(
+                loss, ml_loss, kl_loss, *_extra = criterion(
                     model_output, targets, has_prediction, step=global_step
                 )
                 loss.backward()
@@ -447,6 +450,13 @@ def train_and_evaluate(
                     if patience > 0:
                         patience_counter += 1
 
+                # Restore training mode after validation
+                model.train()
+
+                # DDP barrier: ensure all ranks wait for rank 0's validation
+                if dist.is_initialized():
+                    dist.barrier()
+
                 # Early stopping check
                 if patience > 0 and patience_counter >= patience:
                     logger.info(
@@ -535,12 +545,12 @@ def validate_step(
             if scaler is not None:
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
                     model_output = model(images, t=t, size=size)
-                    loss, ml_loss, kl_loss = criterion(
+                    loss, ml_loss, kl_loss, *_extra = criterion(
                         model_output, targets, has_prediction, step=global_step
                     )
             else:
                 model_output = model(images, t=t, size=size)
-                loss, ml_loss, kl_loss = criterion(
+                loss, ml_loss, kl_loss, *_extra = criterion(
                     model_output, targets, has_prediction, step=global_step
                 )
 
@@ -732,21 +742,15 @@ def train_worker(
             shuffle=False,
             num_workers=config.data.num_workers,
             pin_memory=config.data.pin_memory,
-            drop_last=True,
+            drop_last=False,
         )
 
     # Create model
-    model = TimmOCRModel(
-        model_name=config.model.model_name,
-        pretrained=config.model.pretrained,
-        classifier_type=config.model.classifier_type,
-        embedding_type=config.model.embedding_type,
-        per_digit_bias=config.model.per_digit_bias,
-        uncertainty_head=config.model.uncertainty_head,
-        size_embedding=config.model.size_embedding,
-        use_decoder=config.model.use_decoder,
-        parseq_weights_path=config.model.parseq_weights_path,
-    )
+    model = STNJerseyModel(vit_model_name=config.model.model_name)
+    if rank == 0 and logger:
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        logger.info(f"STN model: {trainable:,} trainable / {total:,} total params")
 
     # Load checkpoint if provided
     if config.model.finetune_from is not None:
@@ -767,12 +771,16 @@ def train_worker(
             model, mode="default" if world_size == 1 else "reduce-overhead"
         )
 
-    # Setup optimizer and scheduler
+    # Setup optimizer with differential learning rate
+    # Lower LR for backbone preserves pretrained features for cross-domain generalization
+    backbone_lr_scale = getattr(config.training, "backbone_lr_scale", 1.0)
+    base_lr = config.training.learning_rate
+    base_model = get_base_model(model)
+
+    # All trainable params get same LR (frozen ViT + PARseq have requires_grad=False)
     optimizer = AdamW(
-        model.parameters(),
-        lr=config.training.learning_rate,
-        fused=True,
-        weight_decay=1e-3,
+        [p for p in model.parameters() if p.requires_grad],
+        lr=base_lr, fused=True, weight_decay=config.training.weight_decay
     )
 
     total_steps = len(train_loader) * config.training.max_epochs
@@ -780,10 +788,11 @@ def train_worker(
 
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=config.training.learning_rate,
+        max_lr=base_lr,
         total_steps=total_steps,
         pct_start=warmup_pct,
         div_factor=25,
+        # final_div_factor=0.2 → final_lr = initial_lr/0.2 = 20% of peak (verified empirically)
         final_div_factor=config.training.final_lr_scale,
         anneal_strategy="cos",
     )

@@ -1,3 +1,4 @@
+import sys; sys.path.insert(0, ".")
 #!/usr/bin/env python3
 """Evaluate trained model on unseen segment-level data with ground truth.
 
@@ -16,7 +17,9 @@ import os
 import cv2
 from collections import defaultdict
 
-from uncertainty_jnr.model import TimmOCRModel
+from uncertainty_jnr.model import STNJerseyModel
+from uncertainty_jnr.inference import aggregate_predictions
+from uncertainty_jnr.preprocessing import letterbox_resize
 from uncertainty_jnr.augmentation import get_val_transforms
 from uncertainty_jnr.utils import load_checkpoint, setup_logging
 from config import Config
@@ -92,29 +95,8 @@ def run_inference_on_segment(model, device, images, batch_size):
     return torch.cat(all_alphas, dim=0), torch.cat(all_uncertainties, dim=0)
 
 
-def aggregate_predictions(alphas, uncertainties):
-    """Aggregate per-crop Dirichlet alphas using uncertainty-weighted summation.
 
-    Two-stage: (1) filter top-25% most uncertain crops, (2) uncertainty-weighted sum.
-    """
-    n = alphas.size(0)
-
-    # Stage 1: filter out top-25% most uncertain crops (if enough crops)
-    if n >= 4:
-        keep_n = max(2, int(n * 0.75))
-        _, keep_idx = uncertainties.topk(keep_n, largest=False)
-        alphas = alphas[keep_idx]
-        uncertainties = uncertainties[keep_idx]
-
-    # Stage 2: uncertainty-weighted alpha summation
-    weights = 1.0 / (uncertainties + 1e-6)
-    weights = weights / weights.sum()
-
-    weighted_alphas = alphas * weights.unsqueeze(1)
-    summed_alpha = weighted_alphas.sum(dim=0)
-
-    agg_probs = summed_alpha / summed_alpha.sum()
-    return agg_probs
+# aggregate_predictions imported from uncertainty_jnr.inference
 
 
 def evaluate_sport(
@@ -220,15 +202,8 @@ def main():
     logging.info(f"Device: {device}")
 
     # Load model
-    model = TimmOCRModel(
-        model_name=config.model.model_name,
-        pretrained=False,
-        classifier_type=config.model.classifier_type,
-        embedding_type=config.model.embedding_type,
-        per_digit_bias=config.model.per_digit_bias,
-        uncertainty_head=config.model.uncertainty_head,
-        use_decoder=config.model.use_decoder,
-    )
+    use_stn = getattr(config.model, "use_stn", False)
+    model = STNJerseyModel(vit_model_name=config.model.model_name)
     load_checkpoint(model, checkpoint_path, device, strict=False)
     model = model.to(device)
     model.eval()

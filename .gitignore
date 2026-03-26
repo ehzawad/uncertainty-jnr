@@ -174,3 +174,8 @@ results
 # Dataset directories
 final_dataset/
 unseen/
+jr_nr_test/
+
+# Model checkpoints
+*.pt
+*.pth
