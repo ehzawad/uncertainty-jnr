@@ -78,7 +78,7 @@ torchdiffeq = "0.2.4"
 flow_matching = "*"
 
 [tool.poetry.group.dev.dependencies]
-black = "^23.7"
+black = "^26.3"
 flake8 = "^7.0"
 flake8-bugbear = "^24.0"
 freezegun = ">=1.2.2"
